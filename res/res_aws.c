@@ -202,13 +202,6 @@
 
 #include "asterisk.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <ctype.h>
-#include <stdint.h>
-
 #include <curl/curl.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
@@ -225,9 +218,10 @@
 #include "asterisk/strings.h"
 #include "asterisk/json.h"
 #include "asterisk/xml.h"
+#include "asterisk/uri.h"
+#include "asterisk/astobj2.h"
 
 #define MODNAME "res_aws"
-#define APPNAME "AWS Toolkit"
 
 /* ----------------------------- Config ----------------------------- */
 
@@ -247,6 +241,18 @@ struct aws_config {
 };
 
 static struct aws_config g_cfg;
+AST_MUTEX_DEFINE_STATIC(g_cfg_lock);
+
+/* Forward declarations */
+struct aws_creds;
+static int get_debug_flag(void);
+static int get_http_timeout(void);
+static int parse_caller_identity_xml(const char *xml_data, struct ast_str **out_arn, 
+                                     struct ast_str **out_user_id, struct ast_str **out_account);
+static int sigv4_headers_for_sts(const char *region, const char *payload,
+                                 const struct aws_creds *creds, struct curl_slist **out_headers);
+static int sigv4_headers_for_sqs(const char *queue_url, const char *payload,
+                                 const struct aws_creds *creds, struct curl_slist **out_headers);
 
 /* ----------------------------- HTTP helpers ----------------------------- */
 
@@ -255,16 +261,53 @@ static size_t write_cb_ast_str(void *contents, size_t size, size_t nmemb, void *
 	size_t realsize = size * nmemb;
 	struct ast_str **str_ptr = (struct ast_str**)userp;
 
+	if (!str_ptr) {
+		return 0;
+	}
+
 	if (!*str_ptr) {
-		*str_ptr = ast_str_create(realsize + 1);
+		*str_ptr = ast_str_create(256);
 		if (!*str_ptr) {
 			return 0;
 		}
 	}
 
-	/* Append the new content using ast_str_append_substr */
-	if (ast_str_append_substr(str_ptr, 0, (const char*)contents, realsize) != 0) {
-		return 0;
+	/* Use ast_str_append_substr like func_curl does */
+	ast_str_append_substr(str_ptr, 0, contents, realsize);
+
+	return realsize;
+}
+
+static size_t header_callback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+	size_t realsize = size * nmemb;
+	struct ast_str **etag_ptr = (struct ast_str**)userp;
+	char *header = (char*)contents;
+
+	/* Look for ETag header */
+	if (strncasecmp(header, "etag:", 5) == 0) {
+		char *value = header + 5;
+		/* Skip whitespace */
+		while (*value && (*value == ' ' || *value == '\t')) value++;
+		
+		/* Find end of header value */
+		char *end = value;
+		while (*end && *end != '\r' && *end != '\n') end++;
+		
+		if (value < end) {
+			/* Strip quotes if present */
+			if (*value == '"' && *(end-1) == '"') {
+				value++;
+				end--;
+			}
+			
+			if (etag_ptr && *etag_ptr == NULL) {
+				*etag_ptr = ast_str_create(end - value + 1);
+				if (*etag_ptr) {
+					ast_str_set_substr(etag_ptr, 0, value, end - value);
+				}
+			}
+		}
 	}
 
 	return realsize;
@@ -292,6 +335,7 @@ static int http_post(const char *url, const struct curl_slist *headers,
 	curl_easy_setopt(curl, CURLOPT_POST, 1L);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs_dup);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb_ast_str);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)out);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
@@ -328,6 +372,7 @@ static int http_get(const char *url, const struct curl_slist *headers,
 
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs_dup);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb_ast_str);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)out);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
@@ -336,6 +381,45 @@ static int http_get(const char *url, const struct curl_slist *headers,
 	res = curl_easy_perform(curl);
 	if (res != CURLE_OK) {
 		ast_log(LOG_ERROR, "HTTP GET error: %s\n", 
+			curl_easy_strerror(res));
+		curl_slist_free_all(hdrs_dup);
+		return -1;
+	}
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
+	curl_slist_free_all(hdrs_dup);
+	return 0;
+}
+
+static int http_put(const char *url, const struct curl_slist *headers, const char *body,
+		    long timeout_ms, long *http_code, struct ast_str **out)
+{
+	RAII_VAR(CURL *, curl, curl_easy_init(), curl_easy_cleanup);
+	struct curl_slist *hdrs_dup = NULL;
+	const struct curl_slist *h;
+	CURLcode res;
+
+	if (!curl) {
+		return -1;
+	}
+
+	for (h = headers; h; h = h->next) {
+		hdrs_dup = curl_slist_append(hdrs_dup, h->data);
+	}
+	*out = NULL; /* Will be allocated by callback */
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs_dup);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb_ast_str);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void*)out);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, timeout_ms);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, MODNAME "/1.0");
+
+	res = curl_easy_perform(curl);
+	if (res != CURLE_OK) {
+		ast_log(LOG_ERROR, "HTTP PUT error: %s\n", 
 			curl_easy_strerror(res));
 		curl_slist_free_all(hdrs_dup);
 		return -1;
@@ -431,25 +515,56 @@ static int aws_signing_key(const char *secret_key, const char *yyyymmdd,
 	return 0;
 }
 
+/*! \brief RFC 3986 compliant URL encoding for AWS */
 static char *url_encode_component(const char *in)
 {
-	char *out;
-	struct ast_str *s = ast_str_create(128);
-	const unsigned char *p;
+	if (ast_strlen_zero(in)) {
+		return ast_strdup("");
+	}
 
+	RAII_VAR(struct ast_str *, s, ast_str_create(strlen(in) * 3 + 1), ast_free);
+	if (!s) {
+		return NULL;
+	}
+
+	const unsigned char *p;
 	for (p = (const unsigned char*)in; *p; ++p) {
-		if (isalnum(*p) || *p == '-' || *p == '_' || 
-		    *p == '.' || *p == '~' || *p == '/') {
+		/* RFC 3986 unreserved characters: ALPHA DIGIT "-" "." "_" "~" */
+		if (isalnum(*p) || *p == '-' || *p == '.' || *p == '_' || *p == '~') {
 			ast_str_append(&s, 0, "%c", *p);
-		} else if (*p == ' ') {
-			ast_str_append(&s, 0, "%c", '+');
 		} else {
+			/* Percent-encode everything else */
 			ast_str_append(&s, 0, "%%%02X", *p);
 		}
 	}
-	out = ast_strdup(ast_str_buffer(s));
-	ast_free(s);
-	return out;
+	
+	return ast_strdup(ast_str_buffer(s));
+}
+
+/*! \brief RFC 3986 path encoding for S3 (preserves forward slashes) */
+static char *s3_encode_path(const char *in)
+{
+	if (ast_strlen_zero(in)) {
+		return ast_strdup("");
+	}
+
+	RAII_VAR(struct ast_str *, s, ast_str_create(strlen(in) * 3 + 1), ast_free);
+	if (!s) {
+		return NULL;
+	}
+
+	const unsigned char *p;
+	for (p = (const unsigned char*)in; *p; ++p) {
+		/* RFC 3986 unreserved characters + "/" for S3 path components */
+		if (isalnum(*p) || *p == '-' || *p == '.' || *p == '_' || *p == '~' || *p == '/') {
+			ast_str_append(&s, 0, "%c", *p);
+		} else {
+			/* Percent-encode everything else */
+			ast_str_append(&s, 0, "%%%02X", *p);
+		}
+	}
+	
+	return ast_strdup(ast_str_buffer(s));
 }
 
 /* ----------------------------- Credentials ----------------------------- */
@@ -551,7 +666,16 @@ static int creds_from_env(struct aws_creds *out)
 	const char *sk = getenv("AWS_SECRET_ACCESS_KEY");
 	const char *st;
 
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Checking environment variables for credentials\n");
+		ast_log(LOG_NOTICE, "AWS: AWS_ACCESS_KEY_ID=%s\n", ak ? "[set]" : "[not set]");
+		ast_log(LOG_NOTICE, "AWS: AWS_SECRET_ACCESS_KEY=%s\n", sk ? "[set]" : "[not set]");
+	}
+
 	if (!ak || !sk) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: No credentials found in environment\n");
+		}
 		return -1;
 	}
 	st = getenv("AWS_SESSION_TOKEN");
@@ -574,13 +698,42 @@ static int creds_from_env(struct aws_creds *out)
 	}
 	out->expiration = 0;
 	out->source = CRED_ENV;
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Credentials loaded from environment (access_key=%s...)\n", 
+			ak ? (strlen(ak) > 4 ? ak + strlen(ak) - 4 : ak) : "none");
+	}
 	return 0;
 }
 
 static int creds_from_static_cfg(struct aws_creds *out)
 {
-	if (!g_cfg.access_key || !g_cfg.secret_key || 
-	    ast_str_strlen(g_cfg.access_key) == 0 || ast_str_strlen(g_cfg.secret_key) == 0) {
+	char access_key_buf[128];
+	char secret_key_buf[128];  
+	char session_token_buf[2048];
+	
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Checking static configuration for credentials\n");
+	}
+
+	/* Copy config values safely with mutex protection */
+	ast_mutex_lock(&g_cfg_lock);
+	int has_access = g_cfg.access_key && ast_str_strlen(g_cfg.access_key) > 0;
+	int has_secret = g_cfg.secret_key && ast_str_strlen(g_cfg.secret_key) > 0;
+	if (has_access && has_secret) {
+		ast_copy_string(access_key_buf, ast_str_buffer(g_cfg.access_key), sizeof(access_key_buf));
+		ast_copy_string(secret_key_buf, ast_str_buffer(g_cfg.secret_key), sizeof(secret_key_buf));
+		if (g_cfg.session_token && ast_str_strlen(g_cfg.session_token) > 0) {
+			ast_copy_string(session_token_buf, ast_str_buffer(g_cfg.session_token), sizeof(session_token_buf));
+		} else {
+			session_token_buf[0] = '\0';
+		}
+	}
+	ast_mutex_unlock(&g_cfg_lock);
+
+	if (!has_access || !has_secret) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: No static credentials configured\n");
+		}
 		return -1;
 	}
 	
@@ -595,10 +748,10 @@ static int creds_from_static_cfg(struct aws_creds *out)
 		return -1;
 	}
 	
-	ast_str_set(&out->access_key, 0, "%s", ast_str_buffer(g_cfg.access_key));
-	ast_str_set(&out->secret_key, 0, "%s", ast_str_buffer(g_cfg.secret_key));
-	if (g_cfg.session_token && ast_str_strlen(g_cfg.session_token) > 0) {
-		ast_str_set(&out->session_token, 0, "%s", ast_str_buffer(g_cfg.session_token));
+	ast_str_set(&out->access_key, 0, "%s", access_key_buf);
+	ast_str_set(&out->secret_key, 0, "%s", secret_key_buf);
+	if (session_token_buf[0] != '\0') {
+		ast_str_set(&out->session_token, 0, "%s", session_token_buf);
 	}
 	
 	out->expiration = 0;
@@ -629,7 +782,7 @@ static int creds_from_ecs(struct aws_creds *out)
 		ast_str_set(&url_str, 0, "%s", full);
 	}
 
-	rc = http_get(ast_str_buffer(url_str), NULL, g_cfg.http_timeout_ms, &code, &body);
+	rc = http_get(ast_str_buffer(url_str), NULL, get_http_timeout(), &code, &body);
 	if (rc || code != 200 || !body) {
 		return -1;
 	}
@@ -675,7 +828,7 @@ fail:
 	if (sk_str) ast_free(sk_str);
 	if (tok_str) ast_free(tok_str);
 	if (exp_str) ast_free(exp_str);
-	if (g_cfg.debug) {
+	if (get_debug_flag()) {
 		ast_log(LOG_WARNING, "Failed to parse ECS creds JSON: %.120s\n",
 			body ? ast_str_buffer(body) : "");
 	}
@@ -695,27 +848,102 @@ static int creds_from_imds(struct aws_creds *out)
 	RAII_VAR(struct ast_str *, url_str, ast_str_create(512), ast_free);
 	struct curl_slist *hdrs2 = NULL;
 
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Checking EC2 IMDS for credentials\n");
+	}
+
 	if (!hdrline_str || !url_str) {
 		return -1;
 	}
 
 	hdrs = curl_slist_append(hdrs, "X-aws-ec2-metadata-token-ttl-seconds: 21600");
-	rc = http_post("http://169.254.169.254/latest/api/token", hdrs, "",
-		       g_cfg.http_timeout_ms, &code, &tok);
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Requesting IMDSv2 token from 169.254.169.254\n");
+	}
+	rc = http_put("http://169.254.169.254/latest/api/token", hdrs, "",
+		      get_http_timeout(), &code, &tok);
 	curl_slist_free_all(hdrs);
 	if (rc || code != 200 || !tok) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: IMDS token request failed (rc=%d, code=%ld, tok=%s)\n", 
+				rc, code, tok ? "exists" : "null");
+			if (code == 405) {
+				ast_log(LOG_NOTICE, "AWS: Trying IMDSv1 fallback (no token)\n");
+			}
+		}
+		
+		/* IMDSv1 fallback for 405 Method Not Allowed */
+		if (code == 405) {
+			code = 0;
+			if (get_debug_flag()) {
+				ast_log(LOG_NOTICE, "AWS: Fetching IAM role from IMDS (v1)\n");
+			}
+			rc = http_get("http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+				      NULL, get_http_timeout(), &code, &role);
+			if (rc || code != 200 || !role) {
+				if (get_debug_flag()) {
+					ast_log(LOG_NOTICE, "AWS: IMDSv1 role fetch failed (rc=%d, code=%ld)\n", rc, code);
+				}
+				return -1;
+			}
+			
+			/* Trim any trailing whitespace/newlines from role name */
+			ast_str_trim_blanks(role);
+			
+			if (get_debug_flag()) {
+				ast_log(LOG_NOTICE, "AWS: Got IAM role via IMDSv1: '%s'\n", ast_str_buffer(role));
+			}
+			
+			/* creds via IMDSv1 */
+			ast_str_set(&url_str, 0, 
+				 "http://169.254.169.254/latest/meta-data/iam/security-credentials/%s",
+				 ast_str_buffer(role));
+			code = 0;
+			if (get_debug_flag()) {
+				ast_log(LOG_NOTICE, "AWS: Fetching credentials from: %s (IMDSv1)\n", ast_str_buffer(url_str));
+			}
+			rc = http_get(ast_str_buffer(url_str), NULL, get_http_timeout(), &code, &body);
+			if (rc || code != 200 || !body) {
+				if (get_debug_flag()) {
+					ast_log(LOG_NOTICE, "AWS: IMDSv1 credentials fetch failed (rc=%d, code=%ld)\n", rc, code);
+				}
+				return -1;
+			}
+			if (get_debug_flag()) {
+				ast_log(LOG_NOTICE, "AWS: Successfully fetched IMDS credentials via IMDSv1\n");
+			}
+			goto parse_creds;
+		}
 		return -1;
 	}
 
-	/* role name */
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Got IMDSv2 token successfully (length=%zu)\n", 
+			tok ? ast_str_strlen(tok) : 0);
+	}
+
+	/* IMDSv2 - role name */
 	ast_str_set(&hdrline_str, 0, "X-aws-ec2-metadata-token: %s", ast_str_buffer(tok));
 	hdrs2 = curl_slist_append(hdrs2, ast_str_buffer(hdrline_str));
 	code = 0;
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Fetching IAM role from IMDS (v2)\n");
+	}
 	rc = http_get("http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-		      hdrs2, g_cfg.http_timeout_ms, &code, &role);
+		      hdrs2, get_http_timeout(), &code, &role);
 	if (rc || code != 200 || !role) {
 		curl_slist_free_all(hdrs2);
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: Failed to get IAM role (rc=%d, code=%ld)\n", rc, code);
+		}
 		return -1;
+	}
+
+	/* Trim any trailing whitespace/newlines from role name */
+	ast_str_trim_blanks(role);
+	
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Got IAM role: '%s'\n", ast_str_buffer(role));
 	}
 
 	/* creds */
@@ -723,12 +951,22 @@ static int creds_from_imds(struct aws_creds *out)
 		 "http://169.254.169.254/latest/meta-data/iam/security-credentials/%s",
 		 ast_str_buffer(role));
 	code = 0;
-	rc = http_get(ast_str_buffer(url_str), hdrs2, g_cfg.http_timeout_ms, &code, &body);
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Fetching credentials from: %s\n", ast_str_buffer(url_str));
+	}
+	rc = http_get(ast_str_buffer(url_str), hdrs2, get_http_timeout(), &code, &body);
 	curl_slist_free_all(hdrs2);
 	if (rc || code != 200 || !body) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: Failed to get credentials (rc=%d, code=%ld)\n", rc, code);
+		}
 		return -1;
 	}
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Successfully fetched IMDS credentials via IMDSv2\n");
+	}
 
+parse_creds:
 	struct ast_str *ak_str = NULL, *sk_str = NULL, *tok_str = NULL, *exp_str = NULL;
 	if (parse_aws_creds_json(ast_str_buffer(body), &ak_str, &sk_str, &tok_str, &exp_str)) {
 		goto fail;
@@ -768,7 +1006,7 @@ fail:
 	if (sk_str) ast_free(sk_str);
 	if (tok_str) ast_free(tok_str);
 	if (exp_str) ast_free(exp_str);
-	if (g_cfg.debug) {
+	if (get_debug_flag()) {
 		ast_log(LOG_WARNING, "Failed to parse IMDS creds JSON: %.120s\n",
 			body ? ast_str_buffer(body) : "");
 	}
@@ -781,16 +1019,48 @@ static int assume_role(const struct aws_creds *base, struct aws_creds *assumed)
 	RAII_VAR(struct ast_str *, date_iso_str, ast_str_create(32), ast_free);
 	RAII_VAR(struct ast_str *, date_short_str, ast_str_create(16), ast_free);
 	const char *service = "sts";
-	const char *host = "sts.amazonaws.com";
+	char region_buf[64];
+	char role_arn_buf[512];
+	char session_name_buf[128];
+	char external_id_buf[128];
+	RAII_VAR(struct ast_str *, host_str, ast_str_create(64), ast_free);
 	RAII_VAR(struct ast_str *, form, ast_str_create(512), ast_free);
 	RAII_VAR(char *, arn_enc, NULL, ast_free);
 	RAII_VAR(char *, sn, NULL, ast_free);
 	RAII_VAR(char *, ex, NULL, ast_free);
-	const char *sess;
 
-	if (ast_str_strlen(g_cfg.sts_role_arn) == 0 || !date_iso_str || !date_short_str || !form) {
+	/* Copy config values safely with mutex protection */
+	ast_mutex_lock(&g_cfg_lock);
+	if (g_cfg.region && ast_str_strlen(g_cfg.region) > 0) {
+		ast_copy_string(region_buf, ast_str_buffer(g_cfg.region), sizeof(region_buf));
+	} else {
+		region_buf[0] = '\0';
+	}
+	if (g_cfg.sts_role_arn && ast_str_strlen(g_cfg.sts_role_arn) > 0) {
+		ast_copy_string(role_arn_buf, ast_str_buffer(g_cfg.sts_role_arn), sizeof(role_arn_buf));
+	} else {
+		role_arn_buf[0] = '\0';
+	}
+	if (g_cfg.sts_external_id && ast_str_strlen(g_cfg.sts_external_id) > 0) {
+		ast_copy_string(external_id_buf, ast_str_buffer(g_cfg.sts_external_id), sizeof(external_id_buf));
+	} else {
+		external_id_buf[0] = '\0';
+	}
+	if (g_cfg.sts_session_name && ast_str_strlen(g_cfg.sts_session_name) > 0) {
+		ast_copy_string(session_name_buf, ast_str_buffer(g_cfg.sts_session_name), sizeof(session_name_buf));
+	} else {
+		session_name_buf[0] = '\0';
+	}
+	ast_mutex_unlock(&g_cfg_lock);
+
+	if (role_arn_buf[0] == '\0' || !date_iso_str || !date_short_str || !form || !host_str) {
 		return -1;
 	}
+	
+	const char *region = region_buf[0] != '\0' ? region_buf : "us-east-1";
+	
+	/* Use regional STS endpoint */
+	ast_str_set(&host_str, 0, "sts.%s.amazonaws.com", region);
 
 	time_t now = time(NULL);
 	struct tm g;
@@ -803,22 +1073,21 @@ static int assume_role(const struct aws_creds *base, struct aws_creds *assumed)
 
 	/* Query params for Action=AssumeRole & Version=2011-06-15 */
 	ast_str_set(&form, 0, "Action=AssumeRole&Version=2011-06-15");
-	arn_enc = url_encode_component(ast_str_buffer(g_cfg.sts_role_arn));
+	arn_enc = url_encode_component(role_arn_buf);
 	if (!arn_enc) {
 		return -1;
 	}
 	ast_str_append(&form, 0, "&RoleArn=%s", arn_enc);
 
-	sess = ast_str_strlen(g_cfg.sts_session_name) == 0 ? 
-		"asterisk-session" : ast_str_buffer(g_cfg.sts_session_name);
+	const char *sess = session_name_buf[0] != '\0' ? session_name_buf : "asterisk-session";
 	sn = url_encode_component(sess);
 	if (!sn) {
 		return -1;
 	}
 	ast_str_append(&form, 0, "&RoleSessionName=%s", sn);
 
-	if (ast_str_strlen(g_cfg.sts_external_id) > 0) {
-		ex = url_encode_component(ast_str_buffer(g_cfg.sts_external_id));
+	if (external_id_buf[0] != '\0') {
+		ex = url_encode_component(external_id_buf);
 		if (!ex) {
 			return -1;
 		}
@@ -840,7 +1109,6 @@ static int assume_role(const struct aws_creds *base, struct aws_creds *assumed)
 	struct curl_slist *hdrs = NULL;
 	RAII_VAR(struct ast_str *, date_hdr_str, ast_str_create(64), ast_free);
 	RAII_VAR(struct ast_str *, tokhdr_str, ast_str_create(2400), ast_free);
-	const char *region;
 
 	if (!payload_hash_str || !canon || !canon_hash_str || !scope_str || !string_to_sign || !auth_str || !date_hdr_str || !tokhdr_str) {
 		return -1;
@@ -854,14 +1122,13 @@ static int assume_role(const struct aws_creds *base, struct aws_creds *assumed)
 	ast_str_set(&canon, 0, 
 		    "POST\n/\n\ncontent-type:application/x-www-form-urlencoded\n"
 		    "host:%s\nx-amz-date:%s\n\ncontent-type;host;x-amz-date\n%s",
-		    host, ast_str_buffer(date_iso_str), ast_str_buffer(payload_hash_str));
+		    ast_str_buffer(host_str), ast_str_buffer(date_iso_str), ast_str_buffer(payload_hash_str));
 
 	if (sha256_hex_to_str((unsigned char*)ast_str_buffer(canon), ast_str_strlen(canon),
 		   &canon_hash_str) != 0) {
 		return -1;
 	}
 
-	region = ast_str_strlen(g_cfg.region) > 0 ? ast_str_buffer(g_cfg.region) : "us-east-1";
 	ast_str_set(&scope_str, 0, "%s/%s/%s/aws4_request", 
 		 ast_str_buffer(date_short_str), region, service);
 	ast_str_set(&string_to_sign, 0, "AWS4-HMAC-SHA256\n%s\n%s\n%s", 
@@ -899,8 +1166,15 @@ static int assume_role(const struct aws_creds *base, struct aws_creds *assumed)
 	RAII_VAR(struct ast_str *, out, NULL, ast_free);
 	int rc;
 
-	rc = http_post("https://sts.amazonaws.com/", hdrs, ast_str_buffer(form),
-		       g_cfg.http_timeout_ms, &code, &out);
+	RAII_VAR(struct ast_str *, sts_url, ast_str_create(128), ast_free);
+	if (!sts_url) {
+		curl_slist_free_all(hdrs);
+		return -1;
+	}
+	ast_str_set(&sts_url, 0, "https://%s/", ast_str_buffer(host_str));
+	
+	rc = http_post(ast_str_buffer(sts_url), hdrs, ast_str_buffer(form),
+		       get_http_timeout(), &code, &out);
 	curl_slist_free_all(hdrs);
 	if (rc || code != 200 || !out) {
 		return -1;
@@ -1002,82 +1276,347 @@ static int assume_role(const struct aws_creds *base, struct aws_creds *assumed)
 	return 0;
 }
 
-static int refresh_creds_locked(void)
+/*! \brief Clean up aws_creds structure */
+static void cleanup_creds(struct aws_creds *creds)
+{
+	if (creds->access_key) {
+		ast_free(creds->access_key);
+		creds->access_key = NULL;
+	}
+	if (creds->secret_key) {
+		ast_free(creds->secret_key);
+		creds->secret_key = NULL;
+	}
+	if (creds->session_token) {
+		ast_free(creds->session_token);
+		creds->session_token = NULL;
+	}
+	creds->source = CRED_NONE;
+	creds->expiration = 0;
+}
+
+/*! \brief Safely copy credentials with deep copy */
+static int copy_creds(const struct aws_creds *src, struct aws_creds *dst)
+{
+	/* Initialize destination */
+	memset(dst, 0, sizeof(*dst));
+	
+	dst->source = src->source;
+	dst->expiration = src->expiration;
+	
+	/* Deep copy ast_str objects */
+	if (src->access_key && ast_str_strlen(src->access_key) > 0) {
+		dst->access_key = ast_str_create(ast_str_strlen(src->access_key) + 1);
+		if (!dst->access_key) {
+			cleanup_creds(dst);
+			return -1;
+		}
+		ast_str_set(&dst->access_key, 0, "%s", ast_str_buffer(src->access_key));
+	}
+	
+	if (src->secret_key && ast_str_strlen(src->secret_key) > 0) {
+		dst->secret_key = ast_str_create(ast_str_strlen(src->secret_key) + 1);
+		if (!dst->secret_key) {
+			cleanup_creds(dst);
+			return -1;
+		}
+		ast_str_set(&dst->secret_key, 0, "%s", ast_str_buffer(src->secret_key));
+	}
+	
+	if (src->session_token && ast_str_strlen(src->session_token) > 0) {
+		dst->session_token = ast_str_create(ast_str_strlen(src->session_token) + 1);
+		if (!dst->session_token) {
+			cleanup_creds(dst);
+			return -1;
+		}
+		ast_str_set(&dst->session_token, 0, "%s", ast_str_buffer(src->session_token));
+	}
+	
+	return 0;
+}
+
+/*! \brief Safely copy config values with mutex protection */
+static void copy_config_values(int *debug, int *http_timeout_ms, int *refresh_skew,
+                               char *region_buf, size_t region_size,
+                               char *role_arn_buf, size_t role_arn_size,
+                               char *external_id_buf, size_t external_id_size)
+{
+	ast_mutex_lock(&g_cfg_lock);
+	
+	if (debug) *debug = g_cfg.debug;
+	if (http_timeout_ms) *http_timeout_ms = g_cfg.http_timeout_ms;
+	if (refresh_skew) *refresh_skew = g_cfg.refresh_skew;
+	
+	if (region_buf) {
+		if (g_cfg.region && ast_str_strlen(g_cfg.region) > 0) {
+			ast_copy_string(region_buf, ast_str_buffer(g_cfg.region), region_size);
+		} else {
+			region_buf[0] = '\0';
+		}
+	}
+	
+	if (role_arn_buf) {
+		if (g_cfg.sts_role_arn && ast_str_strlen(g_cfg.sts_role_arn) > 0) {
+			ast_copy_string(role_arn_buf, ast_str_buffer(g_cfg.sts_role_arn), role_arn_size);
+		} else {
+			role_arn_buf[0] = '\0';
+		}
+	}
+	
+	if (external_id_buf) {
+		if (g_cfg.sts_external_id && ast_str_strlen(g_cfg.sts_external_id) > 0) {
+			ast_copy_string(external_id_buf, ast_str_buffer(g_cfg.sts_external_id), external_id_size);
+		} else {
+			external_id_buf[0] = '\0';
+		}
+	}
+	
+	ast_mutex_unlock(&g_cfg_lock);
+}
+
+/*! \brief Get debug flag safely */
+static int get_debug_flag(void)
+{
+	int debug;
+	ast_mutex_lock(&g_cfg_lock);
+	debug = g_cfg.debug;
+	ast_mutex_unlock(&g_cfg_lock);
+	return debug;
+}
+
+/*! \brief Get HTTP timeout safely */
+static int get_http_timeout(void)
+{
+	int timeout;
+	ast_mutex_lock(&g_cfg_lock);
+	timeout = g_cfg.http_timeout_ms;
+	ast_mutex_unlock(&g_cfg_lock);
+	return timeout;
+}
+
+/*! \brief Get region safely */
+static void get_region(char *buf, size_t size)
+{
+	ast_mutex_lock(&g_cfg_lock);
+	if (g_cfg.region && ast_str_strlen(g_cfg.region) > 0) {
+		ast_copy_string(buf, ast_str_buffer(g_cfg.region), size);
+	} else {
+		ast_copy_string(buf, "us-east-1", size);
+	}
+	ast_mutex_unlock(&g_cfg_lock);
+}
+
+/*! \brief Get refresh skew safely */
+static int get_refresh_skew(void)
+{
+	int skew;
+	ast_mutex_lock(&g_cfg_lock);
+	skew = g_cfg.refresh_skew;
+	ast_mutex_unlock(&g_cfg_lock);
+	return skew > 0 ? skew : 120;
+}
+
+/*! \brief Extract region from AWS service URL if possible */
+static void extract_region_from_url(const char *url, char *region_buf, size_t buf_size)
+{
+	/* Default to configured region */
+	get_region(region_buf, buf_size);
+	
+	if (ast_strlen_zero(url)) return;
+	
+	/* Look for patterns like:
+	 * https://sqs.us-west-2.amazonaws.com/...
+	 * https://bucket.s3.eu-west-1.amazonaws.com/...
+	 * https://s3.us-east-1.amazonaws.com/...
+	 */
+	
+	RAII_VAR(char *, url_copy, ast_strdup(url), ast_free);
+	if (!url_copy) return;
+	
+	char *start = strstr(url_copy, "://");
+	if (!start) return;
+	start += 3; /* Skip "://" */
+	
+	char *dot1 = strchr(start, '.');
+	if (!dot1) return;
+	
+	char *dot2 = strchr(dot1 + 1, '.');
+	if (!dot2) return;
+	
+	/* Check for SQS pattern: sqs.REGION.amazonaws.com */
+	if (ast_begins_with(start, "sqs.") && strstr(dot2, ".amazonaws.com")) {
+		*dot2 = '\0'; /* Null terminate at second dot */
+		const char *region = dot1 + 1;
+		if (!ast_strlen_zero(region)) {
+			ast_copy_string(region_buf, region, buf_size);
+			return;
+		}
+	}
+	
+	/* Check for S3 pattern: BUCKET.s3.REGION.amazonaws.com */
+	if (ast_begins_with(dot1, ".s3.")) {
+		char *dot3 = strchr(dot2 + 1, '.');
+		if (dot3 && strstr(dot3, ".amazonaws.com")) {
+			*dot3 = '\0'; /* Null terminate at third dot */
+			const char *region = dot2 + 1;
+			if (!ast_strlen_zero(region)) {
+				ast_copy_string(region_buf, region, buf_size);
+				return;
+			}
+		}
+	}
+	
+	/* Check for S3 pattern: s3.REGION.amazonaws.com */
+	if (ast_begins_with(start, "s3.") && strstr(dot2, ".amazonaws.com")) {
+		*dot2 = '\0'; /* Null terminate at second dot */
+		const char *region = dot1 + 1;
+		if (!ast_strlen_zero(region)) {
+			ast_copy_string(region_buf, region, buf_size);
+			return;
+		}
+	}
+}
+
+/*! \brief Safely update global credentials with proper cleanup */
+static void set_global_creds(const struct aws_creds *new_creds)
+{
+	/* Clean up old credentials */
+	cleanup_creds(&g_creds);
+	
+	/* Copy new credentials - ignore errors as we've cleaned up old ones */
+	copy_creds(new_creds, &g_creds);
+}
+
+static int refresh_creds_unlocked_into(struct aws_creds *fresh_creds)
 {
 	struct aws_creds c = {0};
 
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Starting credential refresh chain\n");
+	}
+
 	if (!creds_from_env(&c)) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: SUCCESS - Using credentials from environment\n");
+		}
 		goto have;
 	}
 	if (!creds_from_static_cfg(&c)) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: SUCCESS - Using static credentials from config\n");
+		}
 		goto have;
 	}
 	if (!creds_from_ecs(&c)) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: SUCCESS - Using credentials from ECS\n");
+		}
 		goto have;
 	}
 	if (!creds_from_imds(&c)) {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: SUCCESS - Using credentials from EC2 IMDS\n");
+		}
 		goto have;
+	}
+	if (get_debug_flag()) {
+		ast_log(LOG_ERROR, "AWS: FAILED - No credentials found from any source\n");
 	}
 	return -1;
 
 have:
-	if (ast_str_strlen(g_cfg.sts_role_arn) > 0) {
+	/* Check if we need to assume a role */
+	char role_arn_buf[512];
+	copy_config_values(NULL, NULL, NULL, NULL, 0, role_arn_buf, sizeof(role_arn_buf), NULL, 0);
+	
+	if (role_arn_buf[0] != '\0') {
+		if (get_debug_flag()) {
+			ast_log(LOG_NOTICE, "AWS: Attempting to assume role: %s\n", role_arn_buf);
+		}
 		struct aws_creds a = {0};
 		if (!assume_role(&c, &a)) {
+			if (get_debug_flag()) {
+				ast_log(LOG_NOTICE, "AWS: Successfully assumed role\n");
+			}
+			cleanup_creds(&c); /* clean up base creds */
 			c = a; /* use assumed */
+		} else {
+			if (get_debug_flag()) {
+				ast_log(LOG_WARNING, "AWS: Failed to assume role\n");
+			}
+			cleanup_creds(&a); /* clean up failed assumed creds */
 		}
 	}
-	g_creds = c;
+	
+	/* Copy the fresh credentials to output parameter */
+	if (copy_creds(&c, fresh_creds) != 0) {
+		cleanup_creds(&c);
+		return -1;
+	}
+	cleanup_creds(&c); /* clean up temporary creds */
+	
+	if (get_debug_flag()) {
+		ast_log(LOG_NOTICE, "AWS: Credential refresh complete - source=%d\n", fresh_creds->source);
+	}
+	return 0;
+}
+
+static int refresh_creds_locked(void)
+{
+	struct aws_creds fresh = {0};
+	if (refresh_creds_unlocked_into(&fresh) != 0) {
+		return -1;
+	}
+	set_global_creds(&fresh);
+	cleanup_creds(&fresh);
 	return 0;
 }
 
 static int ensure_fresh_creds(void)
 {
-	time_t now = time(NULL);
 	int need = 0;
-	int ok;
-	int refresh_threshold;
+	time_t now = time(NULL);
+	int skew = get_refresh_skew(); /* grabs g_cfg_lock but we are NOT holding g_creds_lock */
 
 	ast_mutex_lock(&g_creds_lock);
 	if (!g_creds.access_key || ast_str_strlen(g_creds.access_key) == 0) {
 		need = 1;
-	} else if (g_creds.expiration > 0) {
-		refresh_threshold = g_cfg.refresh_skew > 0 ? 
-			g_cfg.refresh_skew : 120;
-		if ((g_creds.expiration - now) < refresh_threshold) {
-			need = 1;
-		}
+	} else if (g_creds.expiration > 0 && (g_creds.expiration - now) < skew) {
+		need = 1;
 	}
-	if (need) {
-		refresh_creds_locked();
-	}
-	ok = g_creds.access_key && ast_str_strlen(g_creds.access_key) > 0;
 	ast_mutex_unlock(&g_creds_lock);
-	return ok ? 0 : -1;
+
+	if (!need) {
+		return 0;
+	}
+
+	/* do network work WITHOUT creds lock */
+	struct aws_creds fresh = {0};
+	if (refresh_creds_unlocked_into(&fresh) != 0) {
+		return -1;
+	}
+
+	ast_mutex_lock(&g_creds_lock);
+	/* Double-check that refresh is still needed */
+	if (!g_creds.access_key || ast_str_strlen(g_creds.access_key) == 0 ||
+	    (g_creds.expiration > 0 && (g_creds.expiration - time(NULL)) < skew)) {
+		cleanup_creds(&g_creds);
+		copy_creds(&fresh, &g_creds);
+	}
+	ast_mutex_unlock(&g_creds_lock);
+	cleanup_creds(&fresh);
+	return 0;
 }
 
-/* ----------------------------- SigV4 + SQS ----------------------------- */
+/* ----------------------------- Generic SigV4 Signing ----------------------------- */
 
-static int sigv4_headers_for_sqs(const char *queue_url, const char *payload,
-				  const struct aws_creds *creds,
-				  struct curl_slist **out_headers)
+static int sigv4_sign_request(const char *method, const char *host, const char *path, 
+                              const char *service, const char *region, const char *payload,
+                              const struct aws_creds *creds, struct curl_slist **out_headers)
 {
-	/* Parse URL to get host and path using RAII */
-	const char *host_start = strstr(queue_url, "https://");
-	const char *path_start;
-	RAII_VAR(struct ast_str *, host_str, ast_str_create(256), ast_free);
-	size_t hl;
-
-	if (!host_start || !host_str) {
+	if (!method || !host || !path || !service || !region || !payload || !creds || !out_headers) {
 		return -1;
 	}
-	host_start += 8;
-	path_start = strchr(host_start, '/');
-	if (!path_start) {
-		return -1;
-	}
-	hl = path_start - host_start;
-	ast_str_set_substr(&host_str, 0, host_start, hl);
 
 	RAII_VAR(struct ast_str *, date_iso_str, ast_str_create(32), ast_free);
 	RAII_VAR(struct ast_str *, date_short_str, ast_str_create(16), ast_free);
@@ -1088,22 +1627,11 @@ static int sigv4_headers_for_sqs(const char *queue_url, const char *payload,
 	time_t now = time(NULL);
 	struct tm g;
 	gmtime_r(&now, &g);
-	RAII_VAR(struct ast_str *, temp_date_str, ast_str_create(32), ast_free);
-	RAII_VAR(struct ast_str *, temp_short_str, ast_str_create(16), ast_free);
-	if (!temp_date_str || !temp_short_str) {
-		return -1;
-	}
-	
 	char temp_buf[32];
 	strftime(temp_buf, sizeof(temp_buf), "%Y%m%dT%H%M%SZ", &g);
-	ast_str_set(&temp_date_str, 0, "%s", temp_buf);
+	ast_str_set(&date_iso_str, 0, "%s", temp_buf);
 	strftime(temp_buf, 16, "%Y%m%d", &g);
-	ast_str_set(&temp_short_str, 0, "%s", temp_buf);
-	ast_str_set(&date_iso_str, 0, "%s", ast_str_buffer(temp_date_str));
-	ast_str_set(&date_short_str, 0, "%s", ast_str_buffer(temp_short_str));
-
-	const char *service = "sqs";
-	const char *region = ast_str_strlen(g_cfg.region) > 0 ? ast_str_buffer(g_cfg.region) : "us-east-1";
+	ast_str_set(&date_short_str, 0, "%s", temp_buf);
 
 	RAII_VAR(struct ast_str *, payload_hash_str, ast_str_create(65), ast_free);
 	RAII_VAR(struct ast_str *, canon, ast_str_create(1024), ast_free);
@@ -1111,12 +1639,25 @@ static int sigv4_headers_for_sqs(const char *queue_url, const char *payload,
 	if (!payload_hash_str || !canon || !canon_hash_str) {
 		return -1;
 	}
+	
 	if (sha256_hex_to_str((unsigned char*)payload, strlen(payload), &payload_hash_str) != 0) {
 		return -1;
 	}
 
-	ast_str_set(&canon, 0, "POST\n%s\n\ncontent-type:application/x-www-form-urlencoded\nhost:%s\nx-amz-date:%s\n\ncontent-type;host;x-amz-date\n%s", 
-	           path_start, ast_str_buffer(host_str), ast_str_buffer(date_iso_str), ast_str_buffer(payload_hash_str));
+	/* Build canonical request */
+	ast_str_set(&canon, 0, "%s\n%s\n\ncontent-type:application/x-www-form-urlencoded\nhost:%s\nx-amz-date:%s", 
+	           method, path, host, ast_str_buffer(date_iso_str));
+	
+	/* Add session token to canonical headers if present */
+	if (creds->session_token && ast_str_strlen(creds->session_token) > 0) {
+		ast_str_append(&canon, 0, "\nx-amz-security-token:%s", ast_str_buffer(creds->session_token));
+	}
+	
+	ast_str_append(&canon, 0, "\n\ncontent-type;host;x-amz-date");
+	if (creds->session_token && ast_str_strlen(creds->session_token) > 0) {
+		ast_str_append(&canon, 0, ";x-amz-security-token");
+	}
+	ast_str_append(&canon, 0, "\n%s", ast_str_buffer(payload_hash_str));
 
 	if (sha256_hex_to_str((unsigned char*)ast_str_buffer(canon), ast_str_strlen(canon), &canon_hash_str) != 0) {
 		return -1;
@@ -1148,26 +1689,31 @@ static int sigv4_headers_for_sqs(const char *queue_url, const char *payload,
 	for (int i = 0; i < 32; i++) {
 		ast_str_append(&sig_hex_str, 0, "%02x", sig_bin[i]);
 	}
+
 	RAII_VAR(struct ast_str *, auth_str, ast_str_create(1024), ast_free);
 	RAII_VAR(struct ast_str *, hdr_str, ast_str_create(512), ast_free);
 	if (!auth_str || !hdr_str) {
 		return -1;
 	}
 
-	ast_str_set(&auth_str, 0, "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=content-type;host;x-amz-date, Signature=%s",
-	           ast_str_buffer(creds->access_key), ast_str_buffer(scope_str), ast_str_buffer(sig_hex_str));
+	ast_str_set(&auth_str, 0, "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=content-type;host;x-amz-date", 
+	           ast_str_buffer(creds->access_key), ast_str_buffer(scope_str));
+	if (creds->session_token && ast_str_strlen(creds->session_token) > 0) {
+		ast_str_append(&auth_str, 0, ";x-amz-security-token");
+	}
+	ast_str_append(&auth_str, 0, ", Signature=%s", ast_str_buffer(sig_hex_str));
 
 	struct curl_slist *hdrs = NULL;
 	hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
 	hdrs = curl_slist_append(hdrs, ast_str_buffer(auth_str));
 
-	ast_str_set(&hdr_str, 0, "Host: %s", ast_str_buffer(host_str));
+	ast_str_set(&hdr_str, 0, "Host: %s", host);
 	hdrs = curl_slist_append(hdrs, ast_str_buffer(hdr_str));
 
 	ast_str_set(&hdr_str, 0, "x-amz-date: %s", ast_str_buffer(date_iso_str));
 	hdrs = curl_slist_append(hdrs, ast_str_buffer(hdr_str));
 
-	if (ast_str_strlen(creds->session_token) > 0) {
+	if (creds->session_token && ast_str_strlen(creds->session_token) > 0) {
 		ast_str_set(&hdr_str, 0, "x-amz-security-token: %s", ast_str_buffer(creds->session_token));
 		hdrs = curl_slist_append(hdrs, ast_str_buffer(hdr_str));
 	}
@@ -1176,11 +1722,70 @@ static int sigv4_headers_for_sqs(const char *queue_url, const char *payload,
 	return 0;
 }
 
+/* ----------------------------- SigV4 + STS ----------------------------- */
+
+static int sigv4_headers_for_sts(const char *region, const char *payload,
+                                 const struct aws_creds *creds, struct curl_slist **out_headers)
+{
+	/* Build STS regional endpoint URL */
+	char sts_url[256];
+	snprintf(sts_url, sizeof(sts_url), "https://sts.%s.amazonaws.com/", region);
+	
+	/* Parse URL using Asterisk URI parser */
+	RAII_VAR(struct ast_uri *, parsed_uri, ast_uri_parse_http(sts_url), ao2_cleanup);
+	const char *host, *path;
+
+	if (!parsed_uri) {
+		return -1;
+	}
+
+	host = ast_uri_host(parsed_uri);
+	path = ast_uri_path(parsed_uri);
+	if (!host || !path) {
+		return -1;
+	}
+
+	/* Use generic SigV4 signing function */
+	return sigv4_sign_request("POST", host, path, "sts", region, payload, creds, out_headers);
+}
+
+/* ----------------------------- SigV4 + SQS ----------------------------- */
+
+static int sigv4_headers_for_sqs(const char *queue_url, const char *payload,
+                                 const struct aws_creds *creds, struct curl_slist **out_headers)
+{
+	/* Parse URL using Asterisk URI parser */
+	RAII_VAR(struct ast_uri *, parsed_uri, ast_uri_parse_http(queue_url), ao2_cleanup);
+	const char *host, *path;
+
+	if (!parsed_uri) {
+		return -1;
+	}
+
+	host = ast_uri_host(parsed_uri);
+	path = ast_uri_path(parsed_uri);
+	if (!host || !path) {
+		return -1;
+	}
+
+	/* Extract region from the queue URL host */
+	char region_buf[64];
+	extract_region_from_url(queue_url, region_buf, sizeof(region_buf));
+
+	/* Use generic SigV4 signing function */
+	return sigv4_sign_request("POST", host, path, "sqs", region_buf, payload, creds, out_headers);
+}
+
 static int sqs_send_message(const char *queue_url, const char *body, const char *group_id, const char *dedup_id, int delay_seconds, const char *attrs_kv_pairs, struct ast_str **out_message_id) {
     if (ensure_fresh_creds()) return -1;
 
     struct aws_creds creds;
-    ast_mutex_lock(&g_creds_lock); creds = g_creds; ast_mutex_unlock(&g_creds_lock);
+    ast_mutex_lock(&g_creds_lock);
+    if (copy_creds(&g_creds, &creds) != 0) {
+        ast_mutex_unlock(&g_creds_lock);
+        return -1;
+    }
+    ast_mutex_unlock(&g_creds_lock);
 
     struct ast_str *form = ast_str_create(256);
     ast_str_set(&form, 0, "Action=SendMessage&Version=2012-11-05");
@@ -1199,10 +1804,10 @@ static int sqs_send_message(const char *queue_url, const char *body, const char 
     /* optional message attributes as comma-separated: key=value,key2=value2 (string type) */
     if (attrs_kv_pairs && *attrs_kv_pairs) {
         char *tmp = ast_strdup(attrs_kv_pairs);
+        char *parse = tmp;
         int idx = 1; 
-        char *saveptr = NULL; 
-        char *tok = strtok_r(tmp, ",", &saveptr);
-        while (tok) {
+        char *tok;
+        while ((tok = ast_strsep(&parse, ',', AST_STRSEP_STRIP))) {
             char *eq = strchr(tok, '=');
             if (eq && eq != tok) {
                 *eq = '\0'; 
@@ -1215,43 +1820,50 @@ static int sqs_send_message(const char *queue_url, const char *body, const char 
                 ast_free(ev); 
                 idx++;
             }
-            tok = strtok_r(NULL, ",", &saveptr);
         }
         ast_free(tmp);
-        /* Also tell SQS how many attrs we sent */
-        ast_str_append(&form, 0, "&MessageAttribute.%d.Name=__end__", 1000); /* harmless */
     }
 
     struct curl_slist *hdrs=NULL;
     if (sigv4_headers_for_sqs(queue_url, ast_str_buffer(form), &creds, &hdrs)) { 
         ast_free(form); 
+        cleanup_creds(&creds);
         return -1; 
     }
 
     long code=0;
     RAII_VAR(struct ast_str *, resp, NULL, ast_free);
-    int rc = http_post(queue_url, hdrs, ast_str_buffer(form), g_cfg.http_timeout_ms, &code, &resp);
+    int rc = http_post(queue_url, hdrs, ast_str_buffer(form), get_http_timeout(), &code, &resp);
     curl_slist_free_all(hdrs); ast_free(form);
     if (rc || code!=200 || !resp) {
-        if (g_cfg.debug) ast_log(LOG_WARNING, "SQS send failed: http=%ld body=%.256s\n", code, resp ? ast_str_buffer(resp) : "");
+        if (get_debug_flag()) ast_log(LOG_WARNING, "SQS send failed: http=%ld body=%.256s\n", code, resp ? ast_str_buffer(resp) : "");
+        cleanup_creds(&creds);
         return -1;
     }
 
-    /* Extract <MessageId> using XML parser */
+    /* Extract <MessageId> using XML parser - navigate proper SQS response structure */
     RAII_VAR(struct ast_xml_doc *, doc, ast_xml_read_memory(ast_str_buffer(resp), ast_str_strlen(resp)), ast_xml_close);
     if (doc) {
         struct ast_xml_node *root = ast_xml_get_root(doc);
-        struct ast_xml_node *msg_id = ast_xml_find_element(ast_xml_node_get_children(root), "MessageId", NULL, NULL);
-        if (msg_id) {
-            const char *msg_id_text = ast_xml_get_text(msg_id);
-            if (msg_id_text) {
-                *out_message_id = ast_str_create(256);
-                if (*out_message_id) {
-                    ast_str_set(out_message_id, 0, "%s", msg_id_text);
+        if (root) {
+            /* Look for SendMessageResult element */
+            struct ast_xml_node *result = ast_xml_find_element(ast_xml_node_get_children(root), "SendMessageResult", NULL, NULL);
+            if (result) {
+                /* Look for MessageId within SendMessageResult */
+                struct ast_xml_node *msg_id = ast_xml_find_element(ast_xml_node_get_children(result), "MessageId", NULL, NULL);
+                if (msg_id) {
+                    const char *msg_id_text = ast_xml_get_text(msg_id);
+                    if (msg_id_text && !ast_strlen_zero(msg_id_text)) {
+                        *out_message_id = ast_str_create(strlen(msg_id_text) + 1);
+                        if (*out_message_id) {
+                            ast_str_set(out_message_id, 0, "%s", msg_id_text);
+                        }
+                    }
                 }
             }
         }
     }
+    cleanup_creds(&creds);
     return 0;
 }
 
@@ -1261,22 +1873,25 @@ static int sigv4_headers_for_s3(const char *url, const char *method, const char 
                                 size_t content_length, const struct aws_creds *creds,
                                 struct curl_slist **headers)
 {
-	/* Parse URL to get host and path using RAII */
-	const char *host_start = strstr(url, "https://");
-	const char *path_start;
-	RAII_VAR(struct ast_str *, host_str, ast_str_create(256), ast_free);
-	size_t hl;
+	/* Parse URL using Asterisk URI parser */
+	RAII_VAR(struct ast_uri *, parsed_uri, ast_uri_parse_http(url), ao2_cleanup);
+	const char *host, *path;
 
-	if (!host_start || !host_str) {
+	if (!parsed_uri) {
 		return -1;
 	}
-	host_start += 8;
-	path_start = strchr(host_start, '/');
-	if (!path_start) {
+
+	host = ast_uri_host(parsed_uri);
+	path = ast_uri_path(parsed_uri);
+	if (!host || !path) {
 		return -1;
 	}
-	hl = path_start - host_start;
-	ast_str_set_substr(&host_str, 0, host_start, hl);
+
+	RAII_VAR(struct ast_str *, host_str, ast_str_create(256), ast_free);
+	if (!host_str) {
+		return -1;
+	}
+	ast_str_set(&host_str, 0, "%s", host);
 
 	RAII_VAR(struct ast_str *, date_iso_str, ast_str_create(32), ast_free);
 	RAII_VAR(struct ast_str *, date_short_str, ast_str_create(16), ast_free);
@@ -1302,7 +1917,9 @@ static int sigv4_headers_for_s3(const char *url, const char *method, const char 
 	ast_str_set(&date_short_str, 0, "%s", ast_str_buffer(temp_short_str));
 
 	const char *service = "s3";
-	const char *region = ast_str_strlen(g_cfg.region) > 0 ? ast_str_buffer(g_cfg.region) : "us-east-1";
+	char region_buf[64];
+	extract_region_from_url(url, region_buf, sizeof(region_buf));
+	const char *region = region_buf;
 
 	/* For S3, we use UNSIGNED-PAYLOAD for simplicity */
 	const char *payload_hash = "UNSIGNED-PAYLOAD";
@@ -1313,8 +1930,13 @@ static int sigv4_headers_for_s3(const char *url, const char *method, const char 
 		return -1;
 	}
 
-	ast_str_set(&canon, 0, "%s\n%s\n\n", method, path_start);
-	ast_str_append(&canon, 0, "content-type:%s\n", content_type ? content_type : "application/octet-stream");
+	ast_str_set(&canon, 0, "%s\n%s\n\n", method, path);
+	
+	/* Only include content-type for PUT (uploads), not for GET/DELETE */
+	if (content_type && (strcasecmp(method, "PUT") == 0 || strcasecmp(method, "POST") == 0)) {
+		ast_str_append(&canon, 0, "content-type:%s\n", content_type);
+	}
+	
 	ast_str_append(&canon, 0, "host:%s\n", ast_str_buffer(host_str));
 	ast_str_append(&canon, 0, "x-amz-content-sha256:%s\n", payload_hash);
 	ast_str_append(&canon, 0, "x-amz-date:%s\n", ast_str_buffer(date_iso_str));
@@ -1322,7 +1944,13 @@ static int sigv4_headers_for_s3(const char *url, const char *method, const char 
 		ast_str_append(&canon, 0, "x-amz-security-token:%s\n", ast_str_buffer(creds->session_token));
 	}
 	ast_str_append(&canon, 0, "\n");
-	ast_str_append(&canon, 0, "content-type;host;x-amz-content-sha256;x-amz-date");
+	
+	/* Build signed headers list - only include content-type if we signed it */
+	if (content_type && (strcasecmp(method, "PUT") == 0 || strcasecmp(method, "POST") == 0)) {
+		ast_str_append(&canon, 0, "content-type;host;x-amz-content-sha256;x-amz-date");
+	} else {
+		ast_str_append(&canon, 0, "host;x-amz-content-sha256;x-amz-date");
+	}
 	if (ast_str_strlen(creds->session_token) > 0) {
 		ast_str_append(&canon, 0, ";x-amz-security-token");
 	}
@@ -1376,7 +2004,13 @@ static int sigv4_headers_for_s3(const char *url, const char *method, const char 
 
 	ast_str_set(&auth, 0, "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=", 
 	           ast_str_buffer(creds->access_key), ast_str_buffer(scope_str));
-	ast_str_append(&auth, 0, "content-type;host;x-amz-content-sha256;x-amz-date");
+	           
+	/* Build SignedHeaders to match what we actually signed */
+	if (content_type && (strcasecmp(method, "PUT") == 0 || strcasecmp(method, "POST") == 0)) {
+		ast_str_append(&auth, 0, "content-type;host;x-amz-content-sha256;x-amz-date");
+	} else {
+		ast_str_append(&auth, 0, "host;x-amz-content-sha256;x-amz-date");
+	}
 	if (ast_str_strlen(creds->session_token) > 0) {
 		ast_str_append(&auth, 0, ";x-amz-security-token");
 	}
@@ -1390,6 +2024,12 @@ static int sigv4_headers_for_s3(const char *url, const char *method, const char 
 	
 	ast_str_set(&hdr_str, 0, "Authorization: %s", ast_str_buffer(auth));
 	*headers = curl_slist_append(*headers, ast_str_buffer(hdr_str));
+
+	/* Add Content-Type header only when we signed it */
+	if (content_type && (strcasecmp(method, "PUT") == 0 || strcasecmp(method, "POST") == 0)) {
+		ast_str_set(&hdr_str, 0, "Content-Type: %s", content_type);
+		*headers = curl_slist_append(*headers, ast_str_buffer(hdr_str));
+	}
 
 	ast_str_set(&hdr_str, 0, "x-amz-date: %s", ast_str_buffer(date_iso_str));
 	*headers = curl_slist_append(*headers, ast_str_buffer(hdr_str));
@@ -1435,13 +2075,17 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 	if (ensure_fresh_creds()) return -1;
 
 	struct aws_creds creds;
-	ast_mutex_lock(&g_creds_lock); 
-	creds = g_creds; 
+	ast_mutex_lock(&g_creds_lock);
+	if (copy_creds(&g_creds, &creds) != 0) {
+		ast_mutex_unlock(&g_creds_lock);
+		return -1;
+	}
 	ast_mutex_unlock(&g_creds_lock);
 
 	CURL *curl = curl_easy_init();
 	if (!curl) {
 		ast_log(LOG_ERROR, "Failed to initialize CURL for S3 upload\n");
+		cleanup_creds(&creds);
 		return -1;
 	}
 
@@ -1449,6 +2093,7 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 	if (!file) {
 		ast_log(LOG_ERROR, "Cannot open file for S3 upload: %s\n", filepath);
 		curl_easy_cleanup(curl);
+		cleanup_creds(&creds);
 		return -1;
 	}
 
@@ -1467,10 +2112,19 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 	if (!url_str) {
 		curl_easy_cleanup(curl);
 		fclose(file);
+		cleanup_creds(&creds);
 		return -1;
 	}
-	const char *region_str = ast_str_strlen(g_cfg.region) > 0 ? ast_str_buffer(g_cfg.region) : "us-east-1";
-	ast_str_set(&url_str, 0, "https://%s.s3.%s.amazonaws.com/%s", bucket, region_str, key);
+	char region_buf[64];
+	get_region(region_buf, sizeof(region_buf));
+	char *encoded_key = s3_encode_path(key);
+	if (!encoded_key) {
+		curl_easy_cleanup(curl);
+		cleanup_creds(&creds);
+		return -1;
+	}
+	ast_str_set(&url_str, 0, "https://%s.s3.%s.amazonaws.com/%s", bucket, region_buf, encoded_key);
+	ast_free(encoded_key);
 
 	/* Build headers */
 	struct curl_slist *headers = NULL;
@@ -1479,6 +2133,7 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 	if (!date_str || !short_date) {
 		curl_easy_cleanup(curl);
 		fclose(file);
+		cleanup_creds(&creds);
 		return -1;
 	}
 	
@@ -1495,6 +2150,7 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 	if (!content_type_hdr) {
 		curl_easy_cleanup(curl);
 		fclose(file);
+		cleanup_creds(&creds);
 		return -1;
 	}
 	if (content_type && *content_type) {
@@ -1511,10 +2167,12 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 		if (!meta_copy || !meta_hdr) {
 			curl_easy_cleanup(curl);
 			fclose(file);
+			cleanup_creds(&creds);
 			return -1;
 		}
-		char *saveptr, *pair;
-		for (pair = strtok_r(meta_copy, ",", &saveptr); pair; pair = strtok_r(NULL, ",", &saveptr)) {
+		char *parse = meta_copy;
+		char *pair;
+		while ((pair = ast_strsep(&parse, ',', AST_STRSEP_STRIP))) {
 			char *eq = strchr(pair, '=');
 			if (eq) {
 				*eq = '\0';
@@ -1529,6 +2187,7 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 		if (!tag_hdr) {
 			curl_easy_cleanup(curl);
 			fclose(file);
+			cleanup_creds(&creds);
 			return -1;
 		}
 		ast_str_set(&tag_hdr, 0, "x-amz-tagging: %s", tags);
@@ -1541,20 +2200,27 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 	curl_easy_setopt(curl, CURLOPT_READFUNCTION, s3_read_callback);
 	curl_easy_setopt(curl, CURLOPT_READDATA, &upload_data);
 	curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)file_size);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, g_cfg.http_timeout_ms / 1000);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, get_http_timeout());
 
 	/* Sign request for S3 PUT using SigV4 */
 	if (sigv4_headers_for_s3(ast_str_buffer(url_str), "PUT", ast_str_buffer(content_type_hdr) + 14, file_size, &creds, &headers)) {
 		curl_easy_cleanup(curl);
 		curl_slist_free_all(headers);
 		fclose(file);
+		cleanup_creds(&creds);
 		return -1;
 	}
 
-	RAII_VAR(struct ast_str *, response, NULL, ast_free);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb_ast_str);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	/* Set headers after signing is complete */
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+	/* Set up header callback to capture ETag */
+	if (out_etag) {
+		*out_etag = NULL;
+		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+		curl_easy_setopt(curl, CURLOPT_HEADERDATA, out_etag);
+	}
 
 	/* Perform upload */
 	CURLcode res = curl_easy_perform(curl);
@@ -1565,32 +2231,14 @@ static int s3_put_object(const char *bucket, const char *key, const char *filepa
 	if (res != CURLE_OK || (http_code != 200 && http_code != 201)) {
 		ast_log(LOG_ERROR, "S3 upload failed: HTTP %ld, CURL: %s\n", 
 			http_code, curl_easy_strerror(res));
-		if (response) {
-			ast_log(LOG_ERROR, "S3 response: %s\n", ast_str_buffer(response));
-		}
 		ret = -1;
-	} else {
-		/* Extract ETag from response if available */
-		if (response && out_etag) {
-			const char *response_text = ast_str_buffer(response);
-			const char *etag_start = strstr(response_text, "<ETag>");
-			if (etag_start) {
-				etag_start += 6; /* Skip <ETag> */
-				const char *etag_end = strstr(etag_start, "</ETag>");
-				if (etag_end) {
-					*out_etag = ast_str_create(256);
-					if (*out_etag) {
-						ast_str_set_substr(out_etag, 0, etag_start, etag_end - etag_start);
-					}
-				}
-			}
-		}
 	}
 
 	/* Cleanup */
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
 	fclose(file);
+	cleanup_creds(&creds);
 
 	return ret;
 }
@@ -1600,16 +2248,23 @@ static int s3_get_object(const char *bucket, const char *key, const char *filepa
 	if (ensure_fresh_creds()) return -1;
 
 	struct aws_creds creds;
-	ast_mutex_lock(&g_creds_lock); 
-	creds = g_creds; 
+	ast_mutex_lock(&g_creds_lock);
+	if (copy_creds(&g_creds, &creds) != 0) {
+		ast_mutex_unlock(&g_creds_lock);
+		return -1;
+	}
 	ast_mutex_unlock(&g_creds_lock);
 
 	CURL *curl = curl_easy_init();
-	if (!curl) return -1;
+	if (!curl) {
+		cleanup_creds(&creds);
+		return -1;
+	}
 
 	FILE *file = fopen(filepath, "wb");
 	if (!file) {
 		curl_easy_cleanup(curl);
+		cleanup_creds(&creds);
 		return -1;
 	}
 
@@ -1617,23 +2272,35 @@ static int s3_get_object(const char *bucket, const char *key, const char *filepa
 	if (!url_str) {
 		curl_easy_cleanup(curl);
 		fclose(file);
+		cleanup_creds(&creds);
 		return -1;
 	}
-	const char *region_str = ast_str_strlen(g_cfg.region) > 0 ? ast_str_buffer(g_cfg.region) : "us-east-1";
-	ast_str_set(&url_str, 0, "https://%s.s3.%s.amazonaws.com/%s", bucket, region_str, key);
+	char region_buf[64];
+	get_region(region_buf, sizeof(region_buf));
+	char *encoded_key = s3_encode_path(key);
+	if (!encoded_key) {
+		curl_easy_cleanup(curl);
+		cleanup_creds(&creds);
+		return -1;
+	}
+	ast_str_set(&url_str, 0, "https://%s.s3.%s.amazonaws.com/%s", bucket, region_buf, encoded_key);
+	ast_free(encoded_key);
 
 	struct curl_slist *headers = NULL;
 	
 	if (sigv4_headers_for_s3(ast_str_buffer(url_str), "GET", "application/octet-stream", 0, &creds, &headers)) {
 		curl_easy_cleanup(curl);
 		fclose(file);
+		cleanup_creds(&creds);
 		return -1;
 	}
 
 	curl_easy_setopt(curl, CURLOPT_URL, ast_str_buffer(url_str));
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, file);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, g_cfg.http_timeout_ms / 1000);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);  /* Handle region redirects */
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, get_http_timeout());
 
 	CURLcode res = curl_easy_perform(curl);
 	long http_code = 0;
@@ -1644,6 +2311,7 @@ static int s3_get_object(const char *bucket, const char *key, const char *filepa
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
 	fclose(file);
+	cleanup_creds(&creds);
 
 	return ret;
 }
@@ -1653,32 +2321,50 @@ static int s3_delete_object(const char *bucket, const char *key)
 	if (ensure_fresh_creds()) return -1;
 
 	struct aws_creds creds;
-	ast_mutex_lock(&g_creds_lock); 
-	creds = g_creds; 
+	ast_mutex_lock(&g_creds_lock);
+	if (copy_creds(&g_creds, &creds) != 0) {
+		ast_mutex_unlock(&g_creds_lock);
+		return -1;
+	}
 	ast_mutex_unlock(&g_creds_lock);
 
 	CURL *curl = curl_easy_init();
-	if (!curl) return -1;
+	if (!curl) {
+		cleanup_creds(&creds);
+		return -1;
+	}
 
 	RAII_VAR(struct ast_str *, url_str, ast_str_create(1024), ast_free);
 	if (!url_str) {
 		curl_easy_cleanup(curl);
+		cleanup_creds(&creds);
 		return -1;
 	}
-	const char *region_str = ast_str_strlen(g_cfg.region) > 0 ? ast_str_buffer(g_cfg.region) : "us-east-1";
-	ast_str_set(&url_str, 0, "https://%s.s3.%s.amazonaws.com/%s", bucket, region_str, key);
+	char region_buf[64];
+	get_region(region_buf, sizeof(region_buf));
+	char *encoded_key = s3_encode_path(key);
+	if (!encoded_key) {
+		curl_easy_cleanup(curl);
+		cleanup_creds(&creds);
+		return -1;
+	}
+	ast_str_set(&url_str, 0, "https://%s.s3.%s.amazonaws.com/%s", bucket, region_buf, encoded_key);
+	ast_free(encoded_key);
 
 	struct curl_slist *headers = NULL;
 	
 	if (sigv4_headers_for_s3(ast_str_buffer(url_str), "DELETE", "application/octet-stream", 0, &creds, &headers)) {
 		curl_easy_cleanup(curl);
+		cleanup_creds(&creds);
 		return -1;
 	}
 
 	curl_easy_setopt(curl, CURLOPT_URL, ast_str_buffer(url_str));
 	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, g_cfg.http_timeout_ms / 1000);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);  /* Handle region redirects */
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, get_http_timeout());
 
 	RAII_VAR(struct ast_str *, response, NULL, ast_free);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb_ast_str);
@@ -1692,6 +2378,7 @@ static int s3_delete_object(const char *bucket, const char *key)
 
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
+	cleanup_creds(&creds);
 
 	return ret;
 }
@@ -1736,7 +2423,7 @@ static int s3upload_exec(struct ast_channel *chan, const char *data)
 	if (!ast_strlen_zero(args.options)) {
 		char *opts = ast_strdupa(args.options);
 		char *opt;
-		while ((opt = strsep(&opts, ","))) {
+		while ((opt = ast_strsep(&opts, ',', AST_STRSEP_STRIP))) {
 			char *val = strchr(opt, '=');
 			if (val) {
 				*val++ = '\0';
@@ -1839,7 +2526,8 @@ static int s3delete_exec(struct ast_channel *chan, const char *data)
 
 /* ----------------------------- Original SQS Dialplan app ----------------------------- */
 
-static const char *app = APPNAME;
+/* Application names */
+static const char *sqs_app = "AwsSqsSend";
 
 /*
  * AwsSqsSend(queue, body[, options])
@@ -1863,7 +2551,7 @@ static int app_exec(struct ast_channel *chan, const char *data) {
     AST_STANDARD_APP_ARGS(args, parse);
 
     if (ast_strlen_zero(args.queue) || ast_strlen_zero(args.body)) {
-        ast_log(LOG_ERROR, "%s requires queue and body\n", APPNAME);
+        ast_log(LOG_ERROR, "%s requires queue and body\n", sqs_app);
         return -1;
     }
 
@@ -1885,8 +2573,18 @@ static int app_exec(struct ast_channel *chan, const char *data) {
                 ast_str_set(&queue_url_str, 0, "%s", v);
             }
         }
-        if (ast_str_strlen(queue_url_str) == 0 && ast_str_strlen(g_cfg.default_queue_url) > 0) {
-            ast_str_set(&queue_url_str, 0, "%s", ast_str_buffer(g_cfg.default_queue_url));
+        if (ast_str_strlen(queue_url_str) == 0) {
+            char default_queue_buf[512];
+            ast_mutex_lock(&g_cfg_lock);
+            if (g_cfg.default_queue_url && ast_str_strlen(g_cfg.default_queue_url) > 0) {
+                ast_copy_string(default_queue_buf, ast_str_buffer(g_cfg.default_queue_url), sizeof(default_queue_buf));
+            } else {
+                default_queue_buf[0] = '\0';
+            }
+            ast_mutex_unlock(&g_cfg_lock);
+            if (default_queue_buf[0] != '\0') {
+                ast_str_set(&queue_url_str, 0, "%s", default_queue_buf);
+            }
         }
         if (ast_str_strlen(queue_url_str) == 0) {
             ast_log(LOG_ERROR, "Queue '%s' not found and no default_queue_url set\n", args.queue);
@@ -1897,8 +2595,9 @@ static int app_exec(struct ast_channel *chan, const char *data) {
     int delay=0; const char *group=NULL; const char *dedup=NULL; const char *attrs=NULL;
     if (!ast_strlen_zero(args.opts)) {
         char *opts = ast_strdupa(args.opts);
-        char *saveptr;
-        for (char *tok = strtok_r(opts, ";,", &saveptr); tok; tok = strtok_r(NULL, ";,", &saveptr)) {
+        char *parse = opts;
+        char *tok;
+        while ((tok = ast_strsep(&parse, ',', AST_STRSEP_STRIP))) {
             char *eq = strchr(tok, '='); 
             char *k, *v;
             if (!eq) continue; 
@@ -1934,33 +2633,296 @@ static int app_exec(struct ast_channel *chan, const char *data) {
 /* ----------------------------- CLI ----------------------------- */
 
 static char *cli_show_status(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
-    switch (cmd) { case CLI_INIT: e->command = "aws show status"; e->usage = "Show AWS credential/source status"; return NULL; case CLI_GENERATE: return NULL; }
+    switch (cmd) { 
+        case CLI_INIT: 
+            e->command = "aws show status"; 
+            e->usage = "Show AWS credential/source status"; 
+            return NULL; 
+        case CLI_GENERATE: 
+            return NULL; 
+    }
+    
+    const char *source_names[] = {"none", "environment", "static_config", "ecs", "imds", "sts_assumed"};
+    
     ast_mutex_lock(&g_creds_lock);
-    ast_cli(a->fd, "Source: %d (0 none,1 env,2 static,3 ecs,4 imds,5 sts)\n", g_creds.source);
-    ast_cli(a->fd, "AccessKey: %s\n", g_creds.access_key ? ast_str_buffer(g_creds.access_key) : "");
-    ast_cli(a->fd, "Session? %s\n", (g_creds.session_token && ast_str_strlen(g_creds.session_token) > 0) ? "yes" : "no");
-    if (g_creds.expiration) ast_cli(a->fd, "Expires: %ld\n", (long)g_creds.expiration);
+    ast_cli(a->fd, "\n=== AWS Credential Status ===\n");
+    ast_cli(a->fd, "Source: %s (%d)\n", 
+        g_creds.source >= 0 && g_creds.source <= 5 ? source_names[g_creds.source] : "unknown", 
+        g_creds.source);
+    
+    if (g_creds.access_key && ast_str_strlen(g_creds.access_key) > 0) {
+        const char *ak = ast_str_buffer(g_creds.access_key);
+        int len = strlen(ak);
+        if (len > 4) {
+            ast_cli(a->fd, "AccessKey: ...%s\n", ak + len - 4);
+        } else {
+            ast_cli(a->fd, "AccessKey: %s\n", ak);
+        }
+    } else {
+        ast_cli(a->fd, "AccessKey: [not set]\n");
+    }
+    
+    ast_cli(a->fd, "SessionToken: %s\n", 
+        (g_creds.session_token && ast_str_strlen(g_creds.session_token) > 0) ? "yes" : "no");
+    
+    if (g_creds.expiration) {
+        time_t now = time(NULL);
+        long remaining = g_creds.expiration - now;
+        ast_cli(a->fd, "Expires: %ld (%ld seconds from now)\n", 
+            (long)g_creds.expiration, remaining);
+    } else {
+        ast_cli(a->fd, "Expires: never\n");
+    }
     ast_mutex_unlock(&g_creds_lock);
-    ast_cli(a->fd, "Region: %s\n", g_cfg.region ? ast_str_buffer(g_cfg.region) : "");
+    
+    ast_cli(a->fd, "\n=== Configuration ===\n");
+    char region_buf[64];
+    char role_arn_buf[512];
+    int refresh_skew;
+    
+    ast_mutex_lock(&g_cfg_lock);
+    if (g_cfg.region && ast_str_strlen(g_cfg.region) > 0) {
+        ast_copy_string(region_buf, ast_str_buffer(g_cfg.region), sizeof(region_buf));
+    } else {
+        ast_copy_string(region_buf, "[not set]", sizeof(region_buf));
+    }
+    refresh_skew = g_cfg.refresh_skew;
+    if (g_cfg.sts_role_arn && ast_str_strlen(g_cfg.sts_role_arn) > 0) {
+        ast_copy_string(role_arn_buf, ast_str_buffer(g_cfg.sts_role_arn), sizeof(role_arn_buf));
+    } else {
+        role_arn_buf[0] = '\0';
+    }
+    ast_mutex_unlock(&g_cfg_lock);
+    
+    ast_cli(a->fd, "Region: %s\n", region_buf);
+    ast_cli(a->fd, "Debug: %s\n", get_debug_flag() ? "enabled" : "disabled");
+    ast_cli(a->fd, "HTTP Timeout: %d ms\n", get_http_timeout());
+    ast_cli(a->fd, "Refresh Skew: %d seconds\n", refresh_skew);
+    
+    if (role_arn_buf[0] != '\0') {
+        ast_cli(a->fd, "STS Role ARN: %s\n", role_arn_buf);
+    }
+    
     return CLI_SUCCESS;
 }
 
 static char *cli_refresh(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
-    switch (cmd) { case CLI_INIT: e->command = "aws refresh"; e->usage = "Force refresh of AWS credentials"; return NULL; case CLI_GENERATE: return NULL; }
-    ast_mutex_lock(&g_creds_lock); int rc = refresh_creds_locked(); ast_mutex_unlock(&g_creds_lock);
-    ast_cli(a->fd, "Refresh %s\n", rc?"FAILED":"OK");
+    switch (cmd) { 
+        case CLI_INIT: 
+            e->command = "aws refresh"; 
+            e->usage = "Force refresh of AWS credentials"; 
+            return NULL; 
+        case CLI_GENERATE: 
+            return NULL; 
+    }
+    
+    ast_cli(a->fd, "Refreshing AWS credentials...\n");
+    
+    /* Enable debug temporarily for this refresh */
+    int old_debug = get_debug_flag();
+    ast_mutex_lock(&g_cfg_lock);
+    g_cfg.debug = 1;
+    ast_mutex_unlock(&g_cfg_lock);
+    
+    ast_mutex_lock(&g_creds_lock); 
+    int rc = refresh_creds_locked(); 
+    ast_mutex_unlock(&g_creds_lock);
+    
+    ast_mutex_lock(&g_cfg_lock);
+    g_cfg.debug = old_debug;
+    ast_mutex_unlock(&g_cfg_lock);
+    
+    if (rc) {
+        ast_cli(a->fd, "Refresh FAILED - No credentials found from any source\n");
+        ast_cli(a->fd, "Check /var/log/asterisk/messages for details\n");
+    } else {
+        const char *source_names[] = {"none", "environment", "static_config", "ecs", "imds", "sts_assumed"};
+        ast_cli(a->fd, "Refresh OK - Using %s\n", 
+            g_creds.source >= 0 && g_creds.source <= 5 ? source_names[g_creds.source] : "unknown");
+    }
+    
     return CLI_SUCCESS;
 }
 
+static char *cli_debug(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
+    switch (cmd) {
+        case CLI_INIT:
+            e->command = "aws debug";
+            e->usage = "Usage: aws debug {on|off}\n"
+                       "       Enable or disable AWS module debug logging\n";
+            return NULL;
+        case CLI_GENERATE:
+            return NULL;
+    }
+    
+    if (a->argc != 3) {
+        return CLI_SHOWUSAGE;
+    }
+    
+    if (!strcasecmp(a->argv[2], "on")) {
+        ast_mutex_lock(&g_cfg_lock);
+        g_cfg.debug = 1;
+        ast_mutex_unlock(&g_cfg_lock);
+        ast_cli(a->fd, "AWS debug logging enabled\n");
+    } else if (!strcasecmp(a->argv[2], "off")) {
+        ast_mutex_lock(&g_cfg_lock);
+        g_cfg.debug = 0;
+        ast_mutex_unlock(&g_cfg_lock);
+        ast_cli(a->fd, "AWS debug logging disabled\n");
+    } else {
+        return CLI_SHOWUSAGE;
+    }
+    
+    return CLI_SUCCESS;
+}
+
+static int get_caller_identity(struct ast_str **out_arn, struct ast_str **out_user_id, struct ast_str **out_account) {
+    if (ensure_fresh_creds()) {
+        return -1;
+    }
+    
+    struct aws_creds creds;
+    ast_mutex_lock(&g_creds_lock);
+    if (copy_creds(&g_creds, &creds) != 0) {
+        ast_mutex_unlock(&g_creds_lock);
+        return -1;
+    }
+    ast_mutex_unlock(&g_creds_lock);
+    
+    /* STS GetCallerIdentity request */
+    RAII_VAR(struct ast_str *, form, ast_str_create(256), ast_free);
+    if (!form) {
+        cleanup_creds(&creds);
+        return -1;
+    }
+    ast_str_set(&form, 0, "Action=GetCallerIdentity&Version=2011-06-15");
+    
+    char region_buf[64];
+    get_region(region_buf, sizeof(region_buf));
+    const char *region = region_buf;
+    RAII_VAR(struct curl_slist *, headers, NULL, curl_slist_free_all);
+    
+    if (sigv4_headers_for_sts(region, ast_str_buffer(form), &creds, &headers) != 0) {
+        cleanup_creds(&creds);
+        return -1;
+    }
+    
+    RAII_VAR(struct ast_str *, url_str, ast_str_create(128), ast_free);
+    if (!url_str) {
+        cleanup_creds(&creds);
+        return -1;
+    }
+    ast_str_set(&url_str, 0, "https://sts.%s.amazonaws.com/", region);
+    
+    long code = 0;
+    RAII_VAR(struct ast_str *, response, NULL, ast_free);
+    int rc = http_post(ast_str_buffer(url_str), headers, ast_str_buffer(form), 
+                       get_http_timeout(), &code, &response);
+    
+    if (rc || code != 200 || !response) {
+        cleanup_creds(&creds);
+        return -1;
+    }
+    
+    /* Parse XML response for Arn, UserId, Account */
+    int result = parse_caller_identity_xml(ast_str_buffer(response), out_arn, out_user_id, out_account);
+    cleanup_creds(&creds);
+    return result;
+}
+
+static int parse_caller_identity_xml(const char *xml_data, struct ast_str **out_arn, 
+                                     struct ast_str **out_user_id, struct ast_str **out_account) {
+    struct ast_xml_doc *doc = ast_xml_read_memory((char *)xml_data, strlen(xml_data));
+    if (!doc) {
+        return -1;
+    }
+    
+    struct ast_xml_node *root = ast_xml_get_root(doc);
+    if (!root) {
+        ast_xml_close(doc);
+        return -1;
+    }
+    
+    struct ast_xml_node *result = ast_xml_find_element(ast_xml_node_get_children(root), "GetCallerIdentityResult", NULL, NULL);
+    if (!result) {
+        ast_xml_close(doc);
+        return -1;
+    }
+    
+    struct ast_xml_node *arn_node = ast_xml_find_element(ast_xml_node_get_children(result), "Arn", NULL, NULL);
+    struct ast_xml_node *userid_node = ast_xml_find_element(ast_xml_node_get_children(result), "UserId", NULL, NULL);
+    struct ast_xml_node *account_node = ast_xml_find_element(ast_xml_node_get_children(result), "Account", NULL, NULL);
+    
+    const char *arn_text = arn_node ? ast_xml_get_text(arn_node) : NULL;
+    const char *userid_text = userid_node ? ast_xml_get_text(userid_node) : NULL;
+    const char *account_text = account_node ? ast_xml_get_text(account_node) : NULL;
+    
+    if (arn_text) {
+        *out_arn = ast_str_create(256);
+        if (*out_arn) {
+            ast_str_set(out_arn, 0, "%s", arn_text);
+        }
+    }
+    
+    if (userid_text) {
+        *out_user_id = ast_str_create(128);
+        if (*out_user_id) {
+            ast_str_set(out_user_id, 0, "%s", userid_text);
+        }
+    }
+    
+    if (account_text) {
+        *out_account = ast_str_create(32);
+        if (*out_account) {
+            ast_str_set(out_account, 0, "%s", account_text);
+        }
+    }
+    
+    ast_xml_close(doc);
+    return 0;
+}
+
+static char *cli_show_identity(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a) {
+    switch (cmd) {
+        case CLI_INIT:
+            e->command = "aws show identity";
+            e->usage = "Show AWS caller identity (STS GetCallerIdentity)";
+            return NULL;
+        case CLI_GENERATE:
+            return NULL;
+    }
+    
+    ast_cli(a->fd, "Retrieving AWS caller identity...\n");
+    
+    RAII_VAR(struct ast_str *, arn, NULL, ast_free);
+    RAII_VAR(struct ast_str *, user_id, NULL, ast_free);
+    RAII_VAR(struct ast_str *, account, NULL, ast_free);
+    
+    if (get_caller_identity(&arn, &user_id, &account) != 0) {
+        ast_cli(a->fd, "Failed to retrieve caller identity\n");
+        ast_cli(a->fd, "Check credentials and network connectivity\n");
+        return CLI_SUCCESS;
+    }
+    
+    ast_cli(a->fd, "\n=== AWS Caller Identity ===\n");
+    ast_cli(a->fd, "ARN: %s\n", arn ? ast_str_buffer(arn) : "[not available]");
+    ast_cli(a->fd, "User ID: %s\n", user_id ? ast_str_buffer(user_id) : "[not available]");
+    ast_cli(a->fd, "Account: %s\n", account ? ast_str_buffer(account) : "[not available]");
+    
+    return CLI_SUCCESS;
+}
 
 static struct ast_cli_entry cli_cmds[] = {
     AST_CLI_DEFINE(cli_show_status, "Show AWS credential status"),
+    AST_CLI_DEFINE(cli_show_identity, "Show AWS caller identity"),
     AST_CLI_DEFINE(cli_refresh, "Refresh AWS credentials"),
+    AST_CLI_DEFINE(cli_debug, "Enable/disable AWS module debug logging"),
 };
 
 /* ----------------------------- Config load ----------------------------- */
 
 static void cleanup_config(void) {
+    ast_mutex_lock(&g_cfg_lock);
     if (g_cfg.region) ast_free(g_cfg.region);
     if (g_cfg.default_queue_url) ast_free(g_cfg.default_queue_url);
     if (g_cfg.sts_role_arn) ast_free(g_cfg.sts_role_arn);
@@ -1970,10 +2932,13 @@ static void cleanup_config(void) {
     if (g_cfg.secret_key) ast_free(g_cfg.secret_key);
     if (g_cfg.session_token) ast_free(g_cfg.session_token);
     memset(&g_cfg, 0, sizeof(g_cfg));
+    ast_mutex_unlock(&g_cfg_lock);
 }
 
 static int load_config(void) {
     cleanup_config();
+    
+    ast_mutex_lock(&g_cfg_lock);
     
     /* Initialize all ast_str fields */
     g_cfg.region = ast_str_create(32);
@@ -1987,6 +2952,7 @@ static int load_config(void) {
     
     if (!g_cfg.region || !g_cfg.default_queue_url || !g_cfg.sts_role_arn || !g_cfg.sts_external_id || 
         !g_cfg.sts_session_name || !g_cfg.access_key || !g_cfg.secret_key || !g_cfg.session_token) {
+        ast_mutex_unlock(&g_cfg_lock);
         cleanup_config();
         return -1;
     }
@@ -2000,6 +2966,7 @@ static int load_config(void) {
     struct ast_flags config_flags = { 0 };
     struct ast_config *cfg = ast_config_load("res_aws.conf", config_flags);
     if (!cfg || cfg == CONFIG_STATUS_FILEINVALID) {
+        ast_mutex_unlock(&g_cfg_lock);
         return 0; /* Use defaults */
     }
     
@@ -2038,6 +3005,7 @@ static int load_config(void) {
     if (v) ast_str_set(&g_cfg.session_token, 0, "%s", v);
 
     ast_config_destroy(cfg);
+    ast_mutex_unlock(&g_cfg_lock);
     return 0;
 }
 
@@ -2045,10 +3013,22 @@ static int load_config(void) {
 
 static int unload_module(void) {
     ast_cli_unregister_multiple(cli_cmds, ARRAY_LEN(cli_cmds));
-    ast_unregister_application(app);
+    ast_unregister_application(sqs_app);
     ast_unregister_application(s3upload_app);
     ast_unregister_application(s3download_app);
     ast_unregister_application(s3delete_app);
+    
+    /* Clean up global credentials */
+    ast_mutex_lock(&g_creds_lock);
+    cleanup_creds(&g_creds);
+    ast_mutex_unlock(&g_creds_lock);
+    
+    /* Clean up configuration */
+    cleanup_config();
+    
+    /* Clean up curl global state */
+    curl_global_cleanup();
+    
     return 0;
 }
 
@@ -2060,8 +3040,8 @@ static int load_module(void) {
     refresh_creds_locked();
     ast_mutex_unlock(&g_creds_lock);
 
-    if (ast_register_application(app, app_exec, "Send a message to AWS SQS", "AwsSqsSend(queue, body[, options])")) {
-        ast_log(LOG_ERROR, "Failed to register %s application\n", APPNAME);
+    if (ast_register_application(sqs_app, app_exec, "Send a message to AWS SQS", "AwsSqsSend(queue, body[, options])")) {
+        ast_log(LOG_ERROR, "Failed to register %s application\n", sqs_app);
         return AST_MODULE_LOAD_DECLINE;
     }
     
@@ -2080,7 +3060,9 @@ static int load_module(void) {
         return AST_MODULE_LOAD_DECLINE;
     }
     ast_cli_register_multiple(cli_cmds, ARRAY_LEN(cli_cmds));
-    ast_log(LOG_NOTICE, "%s loaded (region=%s)\n", MODNAME, g_cfg.region ? ast_str_buffer(g_cfg.region) : "");
+    char region_buf[64];
+    get_region(region_buf, sizeof(region_buf));
+    ast_log(LOG_NOTICE, "%s loaded (region=%s)\n", MODNAME, region_buf);
     return AST_MODULE_LOAD_SUCCESS;
 }
 
